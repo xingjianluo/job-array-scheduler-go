@@ -46,7 +46,13 @@ func ShouldAdmit(g *domain.Group) bool {
 //   - at least one SUCCEEDED                         -> SUCCEEDED;
 //   - otherwise any FAILED / TIMED_OUT member        -> FAILED
 //     (the non-success is an execution failure, not a cancellation);
-//   - otherwise (every member CANCELED)              -> CANCELED.
+//   - otherwise (every member CANCELED or SKIPPED)   -> CANCELED.
+//
+// SKIPPED (dependency never satisfied) never decides the group outcome on
+// its own: a skipped member always has an upstream ancestor that FAILED,
+// TIMED_OUT or was CANCELED, and that ancestor's classification is what the
+// group result reflects. This keeps the derivation total, deterministic and
+// independent of completion ordering.
 //
 // Fail-fast groups with one failed member therefore finish FAILED with the
 // remaining members individually CANCELED+group_failfast, keeping the two

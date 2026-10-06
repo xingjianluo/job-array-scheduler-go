@@ -29,6 +29,10 @@ func (s *FileStore) CreateGroup(spec domain.GroupSpec) (*domain.Group, error) {
 	if spec.FailurePolicy == "" {
 		spec.FailurePolicy = domain.FailureContinue
 	}
+	if spec.MaxParallel < 0 {
+		return nil, fmt.Errorf("%w: group MaxParallel must be >= 0",
+			domain.ErrConflict)
+	}
 
 	id := fmt.Sprintf("grp-%04d", s.snap.NextGroupNum)
 	s.snap.NextGroupNum++
@@ -78,6 +82,22 @@ func (s *FileStore) AddJobs(groupID string, specs []domain.JobSpec) ([]*domain.J
 	}
 	timeout := s.defaultJobTimeoutLocked()
 
+	// Dependency validation happens BEFORE any job is created, so an
+	// invalid batch (unknown reference, duplicate name, cycle) fails the
+	// whole AddJobs call atomically and cannot leave half-registered
+	// members behind.
+	existingNames := make([]string, 0, len(g.JobIDs))
+	nameToID := map[string]string{}
+	for _, id := range g.JobIDs {
+		if ej := s.snap.Jobs[id]; ej != nil {
+			existingNames = append(existingNames, ej.Name)
+			nameToID[ej.Name] = id
+		}
+	}
+	if err := policy.ValidateDeps(existingNames, specs); err != nil {
+		return nil, err
+	}
+
 	out := make([]*domain.Job, 0, len(specs))
 	for _, spec := range specs {
 		id := fmt.Sprintf("job-%06d", s.snap.NextJobNum)
@@ -100,14 +120,27 @@ func (s *FileStore) AddJobs(groupID string, specs []domain.JobSpec) ([]*domain.J
 		s.snap.Jobs[id] = j
 		s.snap.JobOrder = append(s.snap.JobOrder, id)
 		g.JobIDs = append(g.JobIDs, id)
+		nameToID[spec.Name] = id
 		out = append(out, j)
 
 		s.emitLocked(domain.Event{
 			Type:    domain.EvJobSubmitted,
 			GroupID: groupID,
 			JobID:   id,
-			Detail:  fmt.Sprintf("name=%q task=%s/%q timeout=%s max_attempts=%d", spec.Name, spec.Task.Kind, spec.Task.Payload, t, retry.MaxAttempts),
+			Detail:  fmt.Sprintf("name=%q task=%s/%q timeout=%s max_attempts=%d depends_on=%v", spec.Name, spec.Task.Kind, spec.Task.Payload, t, retry.MaxAttempts, spec.DependsOn),
 		})
+	}
+	// Resolve dependency names to durable job IDs now that every member of
+	// the batch has an ID.
+	for i, spec := range specs {
+		if len(spec.DependsOn) == 0 {
+			continue
+		}
+		deps := make([]string, 0, len(spec.DependsOn))
+		for _, dn := range spec.DependsOn {
+			deps = append(deps, nameToID[dn])
+		}
+		s.snap.Jobs[out[i].ID].DependsOn = deps
 	}
 
 	// Barrier may release with this batch. For an "all" group this is the
@@ -118,23 +151,46 @@ func (s *FileStore) AddJobs(groupID string, specs []domain.JobSpec) ([]*domain.J
 	} else if g.State == domain.GroupRunning {
 		// Already-admitted group: late members skip the barrier.
 		for _, j := range out {
-			job := s.snap.Jobs[j.ID]
-			job.State = domain.StateReady
-			job.ReadyAt = nowTime()
-			s.emitLocked(domain.Event{
-				Type:    domain.EvJobReady,
-				GroupID: groupID,
-				JobID:   job.ID,
-				Detail:  "late member bypasses open barrier",
-			})
+			s.releaseJobLocked(s.snap.Jobs[j.ID], "late member bypasses open barrier")
 		}
+		s.propagateDepsLocked(g)
 	}
 	return out, nil
 }
 
+// releaseJobLocked moves an admitted PENDING job to its initial runnable
+// state: READY when it has no dependencies, BLOCKED when it must wait for
+// them. Caller holds mu.
+func (s *FileStore) releaseJobLocked(j *domain.Job, detail string) {
+	if j == nil || j.State != domain.StatePending {
+		return
+	}
+	now := nowTime()
+	if len(j.DependsOn) == 0 {
+		j.State = domain.StateReady
+		j.ReadyAt = now
+		s.emitLocked(domain.Event{
+			Type:    domain.EvJobReady,
+			GroupID: j.GroupID,
+			JobID:   j.ID,
+			Detail:  detail,
+		})
+		return
+	}
+	j.State = domain.StateBlocked
+	s.emitLocked(domain.Event{
+		Type:    domain.EvJobBlocked,
+		GroupID: j.GroupID,
+		JobID:   j.ID,
+		Detail:  fmt.Sprintf("waiting for %d dependencies (%s)", len(j.DependsOn), detail),
+	})
+}
+
 // admitLocked transitions a pending group to RUNNING and releases every
-// member to READY. The whole gate opens atomically under the store mutex:
-// no member can be claimed while another is still waiting behind the gate.
+// member. The whole gate opens atomically under the store mutex: no member
+// can be claimed while another is still waiting behind the gate. Members
+// with dependencies are released as BLOCKED and immediately reconciled by
+// propagateDepsLocked (a late member's dependencies may already be settled).
 func (s *FileStore) admitLocked(g *domain.Group, detail string) {
 	now := nowTime()
 	g.State = domain.GroupRunning
@@ -145,17 +201,9 @@ func (s *FileStore) admitLocked(g *domain.Group, detail string) {
 		Detail:  detail,
 	})
 	for _, id := range g.JobIDs {
-		j := s.snap.Jobs[id]
-		if j != nil && j.State == domain.StatePending {
-			j.State = domain.StateReady
-			j.ReadyAt = now
-			s.emitLocked(domain.Event{
-				Type:    domain.EvJobReady,
-				GroupID: g.ID,
-				JobID:   id,
-			})
-		}
+		s.releaseJobLocked(s.snap.Jobs[id], "")
 	}
+	s.propagateDepsLocked(g)
 }
 
 // TryAdmit is driven by the scheduler loop: it finds one still-pending group

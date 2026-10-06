@@ -17,6 +17,7 @@ import (
 
 	"github.com/xingjianluo/job-array-scheduler-go/internal/domain"
 	"github.com/xingjianluo/job-array-scheduler-go/internal/executor"
+	"github.com/xingjianluo/job-array-scheduler-go/internal/policy"
 	"github.com/xingjianluo/job-array-scheduler-go/internal/store"
 	"github.com/xingjianluo/job-array-scheduler-go/internal/task"
 )
@@ -168,9 +169,12 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 
 // SubmitGroup creates a group and submits its member jobs in one batch. The
 // batch is atomic at the API boundary: either every member is accepted or an
-// error is returned and the caller gets no half-registered group.
+// error is returned and the caller gets no half-registered group. Dependency
+// declarations are validated BEFORE anything is created, so an unknown
+// reference or a cycle rejects the submission with no group and no member
+// left behind at all.
 func (s *Scheduler) SubmitGroup(spec domain.GroupSpec, jobs []domain.JobSpec) (*domain.Group, []*domain.Job, error) {
-	if err := validateSpec(spec, len(jobs)); err != nil {
+	if err := validateSpec(spec, jobs); err != nil {
 		return nil, nil, err
 	}
 	g, err := s.st.CreateGroup(spec)
@@ -188,10 +192,11 @@ func (s *Scheduler) SubmitGroup(spec domain.GroupSpec, jobs []domain.JobSpec) (*
 	return g, created, nil
 }
 
-// validateSpec catches submissions whose barrier could never be satisfied and
-// other malformed input up front, with an explicit reject result rather than
-// an eternally pending group.
-func validateSpec(spec domain.GroupSpec, n int) error {
+// validateSpec catches submissions whose barrier could never be satisfied,
+// malformed dependency declarations and other invalid input up front, with
+// an explicit reject result rather than an eternally pending group.
+func validateSpec(spec domain.GroupSpec, jobs []domain.JobSpec) error {
+	n := len(jobs)
 	if n == 0 {
 		return fmt.Errorf("%w: empty job batch", domain.ErrConflict)
 	}
@@ -221,6 +226,14 @@ func validateSpec(spec domain.GroupSpec, n int) error {
 	case "", domain.FailureContinue, domain.FailureFailFast:
 	default:
 		return fmt.Errorf("%w: unknown failure policy %q", domain.ErrConflict, spec.FailurePolicy)
+	}
+	if spec.MaxParallel < 0 {
+		return fmt.Errorf("%w: MaxParallel must be >= 0", domain.ErrConflict)
+	}
+	// Dependency rules: unknown member, duplicate name, self-dependency or
+	// a cycle all reject the whole batch before anything is persisted.
+	if err := policy.ValidateDeps(nil, jobs); err != nil {
+		return err
 	}
 	return nil
 }

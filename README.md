@@ -14,7 +14,7 @@ go run ./cmd/demo             # 确定性端到端演示，打印判定依据与
 ```
 
 演示结束时会对总分类做强断言（例如
-`total=9 succeeded=4 failed=1 timed_out=1 canceled=3`），
+`total=17 succeeded=9 failed=2 timed_out=1 canceled=3 skipped=2`），
 多次运行结论保持一致。
 
 ## 2. 包结构
@@ -24,7 +24,7 @@ go run ./cmd/demo             # 确定性端到端演示，打印判定依据与
 | `internal/domain` | 状态机类型：作业/组/尝试/事件、策略、配置 |
 | `internal/store` | 并发安全的持久化协调层：快照 + 追加事件日志、领取/fencing、恢复 |
 | `internal/task` | 本地模拟任务（ok/fail/flaky/sleep/panic/crash）与**副作用台账** |
-| `internal/policy` | 纯策略函数：屏障准入、quorum 算术、组终态推导 |
+| `internal/policy` | 纯策略函数：屏障准入、quorum 算术、组终态推导、依赖图校验 |
 | `internal/executor` | 工作者循环：领取→心跳→超时/取消上下文执行→fencing 回报 |
 | `internal/scheduler` | 引擎：批量提交、准入循环、租约恢复、工作者编排 |
 | `internal/stats` | 稳定、可复现的终态分类统计报告 |
@@ -35,23 +35,30 @@ go run ./cmd/demo             # 确定性端到端演示，打印判定依据与
 ```
                          ┌──────────── 组屏障准入 ────────────┐
 PENDING ──(组 admitted)──▶ READY ──(被某 worker 领取, 发 token)─▶ RUNNING
-  │                          ▲  ▲                                   │
-  │                          │  └──────── 失败但仍有重试额度(退避等待)┤
-  │                          │                                      ├─▶ SUCCEEDED（终态）
-  │                          │                                      ├─▶ FAILED     （终态：重试耗尽 / panic / 租约过期耗尽）
-  │                          │                                      ├─▶ TIMED_OUT  （终态：超时，不重试）
-  │                          └────────── 租约过期恢复(requeue) ─────┤
-  │                                                                 └─▶ CANCELED   （终态：用户取消 / 组 fail-fast / 屏障前拒绝）
+  │                     │    ▲  ▲                                   │
+  │                     │    │  └──────── 失败但仍有重试额度(退避等待)┤
+  │                     │    │                                      ├─▶ SUCCEEDED（终态）
+  │                     │    │                                      ├─▶ FAILED     （终态：重试耗尽 / panic / 租约过期耗尽）
+  │                     │    │                                      ├─▶ TIMED_OUT  （终态：超时，不重试）
+  │                     │    └────────── 租约过期恢复(requeue) ─────┤
+  │                     │                                           └─▶ CANCELED   （终态：用户取消 / 组 fail-fast / 屏障前拒绝）
+  │                     └─▶ BLOCKED（声明了依赖，等全部依赖 SUCCEEDED）
+  │                              │ 依赖全部成功 ─▶ READY
+  │                              └─▶ SKIPPED（终态：任一依赖未成功）
   └──────────────────────────────────────▶ CANCELED（屏障未开即取消/拒绝）
 ```
 
 要点：
 
-- **终态四分类** `SUCCEEDED / FAILED / TIMED_OUT / CANCELED`，互不混淆；
+- **终态五分类** `SUCCEEDED / FAILED / TIMED_OUT / CANCELED / SKIPPED`，互不混淆；
   非成功终态另有可区分的 **Reason**：`task_failed`、`task_panic`、`timeout`、
-  `user_canceled`、`group_failfast`、`group_rejected`、`lease_expired`。
+  `user_canceled`、`group_failfast`、`group_rejected`、`lease_expired`、
+  `dependency_failed`。
+- **SKIPPED 是独立终态**：成员因依赖未成功而从未执行，绝不计入
+  failed/timed_out/canceled；原因固定为 `dependency_failed`，Message 指明是哪个
+  依赖以什么状态终结。
 - **失败可重试**：普通任务错误（含 panic）在额度内回到 `READY`，由 `NextAttemptAt`
-  实现退避等待；**超时终态不重试**；**取消终态不重试**。
+  实现退避等待；**超时终态不重试**；**取消终态不重试**；**SKIPPED 不重试**。
 - 每次领取生成一条 append-only 的 `Attempt` 记录（尝试号 + 全局单调 fencing token +
   worker + 起止时间 + 结果），使重试、重复领取、崩溃恢复全程可审计。
 
@@ -89,7 +96,40 @@ PENDING ──(组 admitted)──▶ READY ──(被某 worker 领取, 发 tok
 
 - 至少一个 `SUCCEEDED` → 组 `SUCCEEDED`；
 - 无成功且存在 `FAILED`/`TIMED_OUT` → 组 `FAILED`；
-- 全体 `CANCELED` → 组 `CANCELED`。
+- 其余（全部 `CANCELED`/`SKIPPED`）→ 组 `CANCELED`。
+
+`SKIPPED` 从不单独决定组结果：被跳过的成员上游必有一个失败/超时/被取消的祖先，
+组结果由那个祖先的分类决定，因此推导是全函数、确定性、与完成顺序无关的。
+
+### 4.4 组内依赖（`JobSpec.DependsOn`，有向无环图）
+
+提交批次时可按**成员名**声明先后依赖：`DependsOn: ["prep"]` 表示该成员必须等
+`prep` **成功**后才能被领取。未声明依赖的成员行为与之前完全一致。
+
+- **声明即校验，整批原子拒绝**：依赖指向不存在的成员、成员名重复/为空、
+  自依赖、或依赖成环时，`SubmitGroup` 在**创建任何状态之前**返回明确错误
+  （`policy.ValidateDeps` 纯函数判定），这一批不会留下任何组或卡住的成员；
+  增量 `AddJobs` 在写入任何作业前做同样校验（可引用组内已有成员）。
+- **阻塞与放行**：准入后有未满足依赖的成员进入 `BLOCKED`（事件 `job_blocked`），
+  不会被领取；依赖全部 `SUCCEEDED` 后在同一把 store 锁内转为 `READY`
+  （事件 `job_ready`，detail `all dependencies succeeded`）。
+- **失败级联收敛**：任一依赖到达非成功终态（`FAILED`/`TIMED_OUT`/`CANCELED`/
+  `SKIPPED`），下游成员不再干等，在同一锁内收敛为终态 **`SKIPPED` +
+  `dependency_failed`**（事件 `job_skipped`），Message 记录是哪个依赖以什么状态
+  终结；级联按提交序迭代到不动点，更下游不会漏。取消、fail-fast、租约恢复等所有
+  使成员进入终态的路径都经过同一传播点，因此不会出现"永远 BLOCKED"的成员。
+- **持久化**：依赖在提交时解析为作业 ID 存入快照（`Job.DependsOn`），`BLOCKED`
+  状态同样落盘；进程重启/租约恢复后依赖关系不丢不乱，恢复的传播结果与崩溃前
+  完全一致（重复跑结论一致）。
+
+### 4.5 批次并发上限（`GroupSpec.MaxParallel`）
+
+- `0`（缺省）= 不设批次上限，行为与之前一致；`>0` 时同一组同时运行的成员数
+  不超过该值，与全局 `Config.MaxParallel` **同时生效、取更严格者**。
+- 领取扫描遇到已达上限的组会**跳过该成员继续扫描**（而非停止），因此一个长期
+  占满自身额度的批次永远不会把其他批次的成员饿死在队列里；全局 FIFO 领取顺序
+  保持不变。
+- 领取事件的 detail 中带 `group_running=k/n`，可直接审计批次额度占用。
 
 ## 5. 并发领取、去重与崩溃恢复（不重复、不漏执行）
 
@@ -161,11 +201,12 @@ PENDING ──(组 admitted)──▶ READY ──(被某 worker 领取, 发 tok
 ## 9. 可观测性与统计
 
 - 每个决策都有事件：`group_submitted/admitted/rejected`、`job_submitted/ready/
-  claimed/heartbeat/lease_expired/succeeded/failed/retry_wait/timed_out/
-  cancel_requested/canceled`、`group_succeeded/failed/canceled`，事件序号严格递增。
+  blocked/claimed/heartbeat/lease_expired/succeeded/failed/retry_wait/timed_out/
+  skipped/cancel_requested/canceled`、`group_succeeded/failed/canceled`，事件序号严格递增。
 - `stats.Build(store)` 按确定性 ID 顺序生成报告，含每组
-  total/succeeded/failed/timed_out/canceled、按 reason 的细分和每作业终态、尝试次数、
-  输出；同一输入重复构建/重复运行结果字节级一致。
+  total/succeeded/failed/timed_out/canceled/**skipped**、按 reason 的细分
+  （含 `dependency_failed`）和每作业终态、尝试次数、输出；同一输入重复构建/
+  重复运行结果字节级一致。SKIPPED 永远单独成列，不会并入 failed/timed_out/canceled。
 
 ## 10. 测试覆盖
 
@@ -178,9 +219,28 @@ PENDING ──(组 admitted)──▶ READY ──(被某 worker 领取, 发 tok
 - `TestJobTimeout` / `TestCancelRunningJob` / `TestCancelWholeGroupRunning`：
   超时终态不重试、单作业与整组取消、终态重复取消冲突；
 - `TestAdmissionImmediate/AllBarrier/Quorum/BarrierCancel`：三种屏障与屏障前取消；
-- `TestRestartExactlyOnce`：全引擎关闭重开后恢复，重放尝试真实执行体次数为 0；
+- **依赖**：`TestDependencyChainOrder`（BLOCKED→依赖成功后才被领取，事件序号证明顺序）、
+  `TestDependencyRejectedInvalid`（未知成员/自依赖/重名/二元环/三元环全部当场拒绝且不留任何成员）、
+  `TestDependencyCascadeSkip`（根失败→mid/leaf 级联 SKIPPED+dependency_failed、0 次尝试、
+  统计独立成列且重复构建一致）、`TestDependencySkipOnTimeoutAndCancel`
+  （依赖超时/被取消同样收敛为 SKIPPED）；
+- **批次并发上限**：`TestGroupMaxParallel`（cap=2 的组全程运行中成员 ≤2，
+  未设上限的组照常完成、不被饿死）；
+- `TestRestartExactlyOnce` / **`TestDependencySurvivesRestart`**：全引擎关闭重开后恢复，
+  重放尝试真实执行体次数为 0；依赖链跨重启保持 BLOCKED→READY 语义，下游领取严格发生在
+  上游成功之后（事件序号判定）；
 - `TestSnapshotDurabilityAcrossReopen` / `TestRecoverAfterReopen`：快照/日志持久化与
-  崩溃时租约的重开恢复；任务台账幂等/跨重开/崩溃重放与退避算术单测。
+  崩溃时租约的重开恢复；任务台账幂等/跨重开/崩溃重放与退避算术单测；
+- `policy.ValidateDeps` 表驱动单测：合法链/菱形、未知依赖、自依赖、重名、成环。
 
-所有关键用例均在日志中打印 `INPUT`（策略、数量、超时）与 `JUDGMENT`（终态、原因、
-token/尝试依据）。
+所有关键用例均在日志中打印 `INPUT`（策略、数量、超时、依赖声明）与 `JUDGMENT`
+（终态、原因、token/尝试/事件序号依据）。
+
+## 11. 兼容范围
+
+- 未声明 `DependsOn`、未设置 `GroupSpec.MaxParallel` 的批次行为与上一版完全一致；
+  旧版 `state.json`/`events.log` 可直接重开（新字段为零值即"无依赖、无批次上限"）。
+- 依赖只在**同一组内**按成员名解析；跨组依赖不支持（提交时按未知成员拒绝）。
+- 验证方式：`go test ./...`（含 `-race`）覆盖上述全部场景；
+  `go run ./cmd/demo` 端到端演示依赖链、失败级联跳过与批次并发上限，并对总分类
+  （含 `skipped` 列）做强断言，多次运行结论一致。

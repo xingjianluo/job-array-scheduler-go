@@ -103,8 +103,44 @@ func main() {
 	// g4 is one job; wait on the group too.
 	_, _ = sched.WaitGroup(ctx, g4Spec2ID(g4jobs))
 
-	// ---- Scenario 5: simulated process restart --------------------------
-	logf("SCENARIO 5: crash-after-effect + process restart; effect executes exactly once")
+	// ---- Scenario 6: in-group dependencies (DAG) ------------------------
+	logf("SCENARIO 6a: dependency chain prep -> {work-a, work-b}; dependents run only after prep SUCCEEDED")
+	g6Spec := domain.GroupSpec{Name: "dep-chain", Admission: domain.AdmissionImmediate,
+		FailurePolicy: domain.FailureContinue, Retry: domain.RetryPolicy{MaxAttempts: 1}}
+	g6, _, err := sched.SubmitGroup(g6Spec, []domain.JobSpec{
+		{Name: "prep", Task: domain.TaskSpec{Kind: "ok", Payload: "30ms:prepared"}},
+		{Name: "work-a", Task: domain.TaskSpec{Kind: "ok", Payload: "10ms:A"}, DependsOn: []string{"prep"}},
+		{Name: "work-b", Task: domain.TaskSpec{Kind: "ok", Payload: "10ms:B"}, DependsOn: []string{"prep"}},
+	})
+	must(err)
+
+	logf("SCENARIO 6b: failing root -> dependents SKIPPED/dependency_failed (distinct from FAILED/TIMED_OUT/CANCELED)")
+	g7Spec := domain.GroupSpec{Name: "dep-cascade", Admission: domain.AdmissionImmediate,
+		FailurePolicy: domain.FailureContinue, Retry: domain.RetryPolicy{MaxAttempts: 1}}
+	g7, _, err := sched.SubmitGroup(g7Spec, []domain.JobSpec{
+		{Name: "root", Task: domain.TaskSpec{Kind: "fail", Payload: "prep-broken"}},
+		{Name: "mid", Task: domain.TaskSpec{Kind: "ok", Payload: "1ms"}, DependsOn: []string{"root"}},
+		{Name: "leaf", Task: domain.TaskSpec{Kind: "ok", Payload: "1ms"}, DependsOn: []string{"mid"}},
+	})
+	must(err)
+
+	// ---- Scenario 7: per-group concurrency cap --------------------------
+	logf("SCENARIO 7: group MaxParallel=1 serializes its 2 members even with 4 workers")
+	g8Spec := domain.GroupSpec{Name: "capped", Admission: domain.AdmissionImmediate,
+		FailurePolicy: domain.FailureContinue, MaxParallel: 1,
+		Retry: domain.RetryPolicy{MaxAttempts: 1}}
+	g8, _, err := sched.SubmitGroup(g8Spec, []domain.JobSpec{
+		{Name: "seq-1", Task: domain.TaskSpec{Kind: "ok", Payload: "40ms:one"}},
+		{Name: "seq-2", Task: domain.TaskSpec{Kind: "ok", Payload: "40ms:two"}},
+	})
+	must(err)
+
+	for _, id := range []string{g6.ID, g7.ID, g8.ID} {
+		_, err := sched.WaitGroup(ctx, id)
+		must(err)
+	}
+
+	// ---- Scenario 5: simulated process restart --------------------------	logf("SCENARIO 5: crash-after-effect + process restart; effect executes exactly once")
 	g5Spec := domain.GroupSpec{Name: "restart-recovery", Admission: domain.AdmissionImmediate,
 		FailurePolicy: domain.FailureContinue, Retry: domain.RetryPolicy{MaxAttempts: 2}}
 	g5, g5jobs, err := sched.SubmitGroup(g5Spec, []domain.JobSpec{
@@ -147,10 +183,10 @@ func main() {
 
 	// Final stability assertion: the classification must be exactly what the
 	// deterministic inputs dictate.
-	t, s, f, to, c := sum.Totals()
-	fmt.Printf("CHECK: total=%d succeeded=%d failed=%d timed_out=%d canceled=%d\n", t, s, f, to, c)
-	want := [5]int{9, 4, 1, 1, 3}
-	got := [5]int{t, s, f, to, c}
+	t, s, f, to, c, k := sum.Totals()
+	fmt.Printf("CHECK: total=%d succeeded=%d failed=%d timed_out=%d canceled=%d skipped=%d\n", t, s, f, to, c, k)
+	want := [6]int{17, 9, 2, 1, 3, 2}
+	got := [6]int{t, s, f, to, c, k}
 	if got != want {
 		log.Fatalf("NON-DETERMINISTIC RESULT: got %v want %v", got, want)
 	}

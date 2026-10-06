@@ -2,10 +2,15 @@
 //
 // Classification is two-level on purpose:
 //
-//	coarse (one of SUCCEEDED / FAILED / TIMED_OUT / CANCELED) — the final
-//	statistical columns required for repeatable end-to-end conclusions;
+//	coarse (one of SUCCEEDED / FAILED / TIMED_OUT / CANCELED / SKIPPED) —
+//	the final statistical columns required for repeatable end-to-end
+//	conclusions;
 //	fine (job.Reason: task_failed / task_panic / timeout / user_canceled /
-//	group_failfast / lease_expired ...) — the distinguishable cause.
+//	group_failfast / lease_expired / dependency_failed ...) — the
+//	distinguishable cause.
+//
+// SKIPPED is its own coarse column: a member that never ran because a
+// dependency did not succeed is never folded into failed/timed_out/canceled.
 //
 // Every string is rendered from sorted inputs (group/job IDs are generated
 // deterministically), so the same scenario always produces byte-identical
@@ -32,6 +37,7 @@ type GroupSummary struct {
 	Failed    int
 	TimedOut  int
 	Canceled  int
+	Skipped   int
 	ByReason  map[string]int
 	Jobs      []*domain.Job
 }
@@ -86,6 +92,8 @@ func Build(st store.Store) *Summary {
 				gs.TimedOut++
 			case domain.StateCanceled:
 				gs.Canceled++
+			case domain.StateSkipped:
+				gs.Skipped++
 			}
 			if j.State != domain.StateSucceeded {
 				r := j.Reason
@@ -101,13 +109,14 @@ func Build(st store.Store) *Summary {
 }
 
 // Totals aggregates all groups.
-func (s *Summary) Totals() (total, ok, failed, timeout, canceled int) {
+func (s *Summary) Totals() (total, ok, failed, timeout, canceled, skipped int) {
 	for _, g := range s.Groups {
 		total += g.Total
 		ok += g.Succeeded
 		failed += g.Failed
 		timeout += g.TimedOut
 		canceled += g.Canceled
+		skipped += g.Skipped
 	}
 	return
 }
@@ -116,16 +125,17 @@ func (s *Summary) Totals() (total, ok, failed, timeout, canceled int) {
 func (s *Summary) String() string {
 	var b strings.Builder
 	b.WriteString("==================== JOB-ARRAY SCHEDULER SUMMARY ====================\n")
-	var T, S, F, TO, C int
+	var T, S, F, TO, C, K int
 	for _, g := range s.Groups {
 		T += g.Total
 		S += g.Succeeded
 		F += g.Failed
 		TO += g.TimedOut
 		C += g.Canceled
+		K += g.Skipped
 		fmt.Fprintf(&b, "group %s %q state=%s duration=%s\n", g.GroupID, g.Name, g.State, g.Duration().Round(time.Millisecond))
-		fmt.Fprintf(&b, "  jobs total=%d  succeeded=%d  failed=%d  timed_out=%d  canceled=%d\n",
-			g.Total, g.Succeeded, g.Failed, g.TimedOut, g.Canceled)
+		fmt.Fprintf(&b, "  jobs total=%d  succeeded=%d  failed=%d  timed_out=%d  canceled=%d  skipped=%d\n",
+			g.Total, g.Succeeded, g.Failed, g.TimedOut, g.Canceled, g.Skipped)
 		reasons := make([]string, 0, len(g.ByReason))
 		for r := range g.ByReason {
 			reasons = append(reasons, r)
@@ -148,7 +158,7 @@ func (s *Summary) String() string {
 			b.WriteString(line + "\n")
 		}
 	}
-	fmt.Fprintf(&b, "TOTAL: jobs=%d succeeded=%d failed=%d timed_out=%d canceled=%d\n", T, S, F, TO, C)
+	fmt.Fprintf(&b, "TOTAL: jobs=%d succeeded=%d failed=%d timed_out=%d canceled=%d skipped=%d\n", T, S, F, TO, C, K)
 	b.WriteString("=====================================================================\n")
 	return b.String()
 }

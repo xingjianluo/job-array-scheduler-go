@@ -41,6 +41,12 @@ func (s *FileStore) ClaimNext(workerID string, now time.Time) (*domain.Job, *dom
 		if !j.NextAttemptAt.IsZero() && now.Before(j.NextAttemptAt) {
 			continue
 		}
+		// Per-group concurrency cap: a saturated group is skipped over (not
+		// blocking the scan), so its members can never starve other groups,
+		// and the effective limit is min(global cap, group cap).
+		if gcap := g.Spec.MaxParallel; gcap > 0 && s.runningInGroupLocked(g.ID) >= gcap {
+			continue
+		}
 		// Lease it.
 		token := s.snap.NextToken
 		s.snap.NextToken++
@@ -56,6 +62,11 @@ func (s *FileStore) ClaimNext(workerID string, now time.Time) (*domain.Job, *dom
 		j.State = domain.StateRunning
 		j.CancelRequested = false
 		j.CancelReason = ""
+		detail := fmt.Sprintf("lease granted (running=%d/%d, attempt=%d/%d)",
+			s.runningCountLocked(), cap, attemptNo, j.Retry.MaxAttempts)
+		if gcap := g.Spec.MaxParallel; gcap > 0 {
+			detail += fmt.Sprintf(" group_running=%d/%d", s.runningInGroupLocked(g.ID), gcap)
+		}
 		s.emitLocked(domain.Event{
 			Type:     domain.EvJobClaimed,
 			GroupID:  j.GroupID,
@@ -63,8 +74,7 @@ func (s *FileStore) ClaimNext(workerID string, now time.Time) (*domain.Job, *dom
 			WorkerID: workerID,
 			Attempt:  attemptNo,
 			Token:    token,
-			Detail: fmt.Sprintf("lease granted (running=%d/%d, attempt=%d/%d)",
-				s.runningCountLocked(), cap, attemptNo, j.Retry.MaxAttempts),
+			Detail:   detail,
 		})
 		return cloneJob(j), cloneAttempt(a), nil
 	}
@@ -83,6 +93,21 @@ func (s *FileStore) runningCountLocked() int {
 	n := 0
 	for _, j := range s.snap.Jobs {
 		if j.State == domain.StateRunning {
+			n++
+		}
+	}
+	return n
+}
+
+// runningInGroupLocked counts RUNNING members of one group (per-group cap).
+func (s *FileStore) runningInGroupLocked(groupID string) int {
+	g := s.snap.Groups[groupID]
+	if g == nil {
+		return 0
+	}
+	n := 0
+	for _, id := range g.JobIDs {
+		if j := s.snap.Jobs[id]; j != nil && j.State == domain.StateRunning {
 			n++
 		}
 	}
@@ -300,6 +325,71 @@ func (s *FileStore) afterMemberSettledLocked(j *domain.Job) {
 	s.finalizeGroupIfDoneLocked(g.ID)
 }
 
+// propagateDepsLocked reconciles every BLOCKED member of the group with the
+// current state of its dependencies, iterating to a fixpoint so cascades
+// (a skip unblocking further skips) settle within this one locked section:
+//
+//   - all dependencies SUCCEEDED          -> READY (claimable);
+//   - any dependency at a non-success     -> SKIPPED + dependency_failed
+//     terminal state (FAILED / TIMED_OUT /   (terminal; the member never
+//     CANCELED / SKIPPED)                    runs and is classified apart
+//     from real failures, timeouts and cancels).
+//
+// Deterministic: members are scanned in submission (JobIDs) order and the
+// loop only stops when a full pass changes nothing, so the same member
+// states always produce the same propagation result.
+func (s *FileStore) propagateDepsLocked(g *domain.Group) {
+	for changed := true; changed; {
+		changed = false
+		for _, id := range g.JobIDs {
+			j := s.snap.Jobs[id]
+			if j == nil || j.State != domain.StateBlocked {
+				continue
+			}
+			allOK := true
+			var badDep *domain.Job
+			for _, depID := range j.DependsOn {
+				d := s.snap.Jobs[depID]
+				if d == nil || d.State == domain.StateSucceeded {
+					continue
+				}
+				allOK = false
+				if d.State.Terminal() {
+					badDep = d
+				}
+				break
+			}
+			switch {
+			case badDep != nil:
+				now := nowTime()
+				j.State = domain.StateSkipped
+				j.Reason = domain.ReasonDependencyFailed
+				j.Message = fmt.Sprintf("dependency %s (%q) reached %s",
+					badDep.ID, badDep.Name, badDep.State)
+				j.FinishedAt = now
+				s.emitLocked(domain.Event{
+					Type:    domain.EvJobSkipped,
+					GroupID: g.ID,
+					JobID:   j.ID,
+					Detail: fmt.Sprintf("reason=%s: %s",
+						domain.ReasonDependencyFailed, j.Message),
+				})
+				changed = true
+			case allOK:
+				j.State = domain.StateReady
+				j.ReadyAt = nowTime()
+				s.emitLocked(domain.Event{
+					Type:    domain.EvJobReady,
+					GroupID: g.ID,
+					JobID:   j.ID,
+					Detail:  "all dependencies succeeded",
+				})
+				changed = true
+			}
+		}
+	}
+}
+
 // finalizeGroupIfDoneLocked closes the group when all members are terminal.
 // Success/failure/cancel classification follows policy.GroupTerminal, giving
 // a single deterministic group result independent of completion ordering.
@@ -308,6 +398,11 @@ func (s *FileStore) finalizeGroupIfDoneLocked(groupID string) {
 	if g == nil || g.State != domain.GroupRunning {
 		return
 	}
+	// Settle dependency-driven transitions first: a member that just became
+	// terminal may unblock (READY) or cascade-skip (SKIPPED) its dependents,
+	// and only the fixpoint of that propagation decides whether the group is
+	// really done.
+	s.propagateDepsLocked(g)
 	jobs := make([]*domain.Job, 0, len(g.JobIDs))
 	for _, id := range g.JobIDs {
 		j := s.snap.Jobs[id]
@@ -334,9 +429,10 @@ func (s *FileStore) finalizeGroupIfDoneLocked(groupID string) {
 	s.emitLocked(domain.Event{
 		Type:    evType,
 		GroupID: groupID,
-		Detail: fmt.Sprintf("group settled %s (success=%d failed=%d timeout=%d canceled=%d)",
+		Detail: fmt.Sprintf("group settled %s (success=%d failed=%d timeout=%d canceled=%d skipped=%d)",
 			final, counts[domain.StateSucceeded], counts[domain.StateFailed],
-			counts[domain.StateTimedOut], counts[domain.StateCanceled]),
+			counts[domain.StateTimedOut], counts[domain.StateCanceled],
+			counts[domain.StateSkipped]),
 	})
 }
 

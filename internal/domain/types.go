@@ -11,13 +11,21 @@ import "time"
 // JobState is the lifecycle state of a single job.
 //
 //	PENDING -> READY -> RUNNING -> SUCCEEDED
-//	                  |          -> FAILED (retryable failure goes back to READY)
-//	                  |          -> TIMED_OUT
-//	                  |          -> CANCELED
-//	PENDING / READY / RUNNING -> CANCELED
+//	           |       |          -> FAILED (retryable failure goes back to READY)
+//	           |       |          -> TIMED_OUT
+//	           |       |          -> CANCELED
+//	           |       +-> BLOCKED: admitted, but declared dependencies are
+//	           |           not all SUCCEEDED yet; not claimable. Moves to READY
+//	           |           once every dependency succeeded, or to SKIPPED when
+//	           |           any dependency reaches a non-success terminal state.
+//	PENDING / READY / RUNNING / BLOCKED -> CANCELED
+//	BLOCKED -> SKIPPED (dependency failed / timed out / canceled / skipped)
 //
-// FAILED, TIMED_OUT and CANCELED are all non-retryable terminal states;
-// the distinction between them is the final statistical classification.
+// FAILED, TIMED_OUT, CANCELED and SKIPPED are all non-retryable terminal
+// states; the distinction between them is the final statistical
+// classification. SKIPPED means "never ran because an upstream dependency
+// did not succeed" and is always kept separate from a genuine execution
+// failure, a timeout and a cancellation.
 type JobState string
 
 const (
@@ -27,6 +35,10 @@ const (
 	// A job that is waiting for a retry backoff also stays in READY and
 	// becomes claimable once NextAttemptAt has passed.
 	StateReady JobState = "READY"
+	// StateBlocked: group admitted, but the job declared dependencies that
+	// have not all succeeded yet. Not claimable; waits for dependency
+	// resolution (READY on all-success, SKIPPED on any non-success).
+	StateBlocked JobState = "BLOCKED"
 	// StateRunning: a worker holds the lease and an attempt is executing.
 	StateRunning JobState = "RUNNING"
 	// StateSucceeded: one attempt completed successfully. Terminal.
@@ -39,12 +51,17 @@ const (
 	// StateCanceled: the job was canceled by the user or by its group's
 	// fail-fast policy. Terminal.
 	StateCanceled JobState = "CANCELED"
+	// StateSkipped: the job never ran because one of its dependencies
+	// reached a non-success terminal state (failed / timed out / canceled /
+	// itself skipped). Terminal, and classified separately from FAILED,
+	// TIMED_OUT and CANCELED.
+	StateSkipped JobState = "SKIPPED"
 )
 
 // Terminal reports whether the state is a final state.
 func (s JobState) Terminal() bool {
 	switch s {
-	case StateSucceeded, StateFailed, StateTimedOut, StateCanceled:
+	case StateSucceeded, StateFailed, StateTimedOut, StateCanceled, StateSkipped:
 		return true
 	default:
 		return false
@@ -69,6 +86,10 @@ const (
 	// ReasonGroupRejected: the group submission itself was rejected and
 	// its members never became runnable.
 	ReasonGroupRejected = "group_rejected"
+	// ReasonDependencyFailed: the job was SKIPPED because a dependency
+	// reached a non-success terminal state (or was itself skipped). The
+	// job never ran; this reason is distinct from every execution outcome.
+	ReasonDependencyFailed = "dependency_failed"
 )
 
 // ---------------------------------------------------------------------------
@@ -186,6 +207,13 @@ type JobSpec struct {
 	Name    string        `json:"name"`
 	Task    TaskSpec      `json:"task"`
 	Timeout time.Duration `json:"timeout"` // 0 => Config.DefaultJobTimeout
+	// DependsOn names other members of the SAME group that must all reach
+	// SUCCEEDED before this member becomes claimable. Names must reference
+	// members of the batch (or, for incremental AddJobs, existing group
+	// members) and the dependency graph must be acyclic; invalid references
+	// or cycles reject the whole submission atomically. Empty means the
+	// member behaves exactly as before (runnable as soon as admitted).
+	DependsOn []string `json:"depends_on,omitempty"`
 }
 
 // GroupSpec describes a batch. A group decides as a whole when its members
@@ -195,6 +223,12 @@ type GroupSpec struct {
 	Admission       AdmissionPolicy `json:"admission"`
 	FailurePolicy   FailurePolicy   `json:"failure_policy"`
 	ExpectedMembers int             `json:"expected_members"` // used by all/quorum
+	// MaxParallel optionally caps how many members of THIS group may run
+	// concurrently. 0 means no per-group cap. The effective concurrency is
+	// the stricter of this cap and the global Config.MaxParallel; members of
+	// other groups are never starved by a capped group (the claim scan skips
+	// over a saturated group and keeps looking).
+	MaxParallel int `json:"max_parallel,omitempty"`
 	// Retry is applied to every member of the batch.
 	Retry RetryPolicy `json:"retry"`
 }
@@ -231,6 +265,11 @@ type Job struct {
 	Task    TaskSpec      `json:"task"`
 	Retry   RetryPolicy   `json:"retry"`
 	Timeout time.Duration `json:"timeout"`
+
+	// DependsOn holds the resolved IDs of this job's in-group dependencies
+	// (submitted by member name, resolved durably at submission time). All
+	// of them must be SUCCEEDED before the job leaves BLOCKED.
+	DependsOn []string `json:"depends_on,omitempty"`
 
 	State   JobState `json:"state"`
 	Reason  string   `json:"reason,omitempty"`
@@ -307,6 +346,7 @@ const (
 	EvGroupAdmitted   = "group_admitted"
 	EvGroupRejected   = "group_rejected"
 	EvJobReady        = "job_ready"
+	EvJobBlocked      = "job_blocked"
 	EvJobClaimed      = "job_claimed"
 	EvJobHeartbeat    = "job_heartbeat"
 	EvJobLeaseExpired = "job_lease_expired"
@@ -315,6 +355,7 @@ const (
 	EvJobRetryWait    = "job_retry_wait"
 	EvJobTimedOut     = "job_timed_out"
 	EvJobCanceled     = "job_canceled"
+	EvJobSkipped      = "job_skipped"
 	EvJobCancelReq    = "job_cancel_requested"
 	EvGroupSucceeded  = "group_succeeded"
 	EvGroupFailed     = "group_failed"
